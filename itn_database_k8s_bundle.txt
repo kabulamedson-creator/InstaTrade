@@ -1,0 +1,462 @@
+# ============================================
+# FILE: db/schema.sql
+# ============================================
+---
+-- InstantTrade Network - Database Schema
+-- PostgreSQL 15+
+
+-- Enable extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================
+-- ACCOUNTS
+-- ============================================
+
+CREATE TABLE accounts (
+    id VARCHAR(50) PRIMARY KEY,
+    account_type VARCHAR(20) NOT NULL CHECK (account_type IN ('SUPPLIER', 'BUYER', 'CAPITAL_PROVIDER')),
+    name VARCHAR(255) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACTIVE', 'SUSPENDED', 'FROZEN')),
+    kyc_status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (kyc_status IN ('PENDING', 'VERIFIED', 'REJECTED')),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_accounts_status ON accounts(status);
+CREATE INDEX idx_accounts_type ON accounts(account_type);
+
+-- ============================================
+-- INVOICES
+-- ============================================
+
+CREATE TABLE invoices (
+    id VARCHAR(50) PRIMARY KEY,
+    supplier_id VARCHAR(50) NOT NULL REFERENCES accounts(id),
+    buyer_id VARCHAR(50) NOT NULL REFERENCES accounts(id),
+    amount DECIMAL(15,2) NOT NULL CHECK (amount >= 100 AND amount <= 10000000),
+    terms INTEGER NOT NULL CHECK (terms IN (0, 15, 30, 45, 60, 90)),
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACCEPTED', 'SETTLED', 'REJECTED', 'EXPIRED', 'FRAUD_REVIEW')),
+    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+    invoice_hash VARCHAR(64) NOT NULL UNIQUE,
+    purchase_order_id VARCHAR(50),
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_invoices_supplier ON invoices(supplier_id);
+CREATE INDEX idx_invoices_buyer ON invoices(buyer_id);
+CREATE INDEX idx_invoices_status ON invoices(status);
+CREATE INDEX idx_invoices_hash ON invoices(invoice_hash);
+CREATE INDEX idx_invoices_created ON invoices(created_at);
+
+-- ============================================
+-- LINE ITEMS
+-- ============================================
+
+CREATE TABLE line_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    invoice_id VARCHAR(50) NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    description VARCHAR(500) NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(15,2) NOT NULL CHECK (unit_price > 0),
+    amount DECIMAL(15,2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_line_items_invoice ON line_items(invoice_id);
+
+-- ============================================
+-- SETTLEMENTS
+-- ============================================
+
+CREATE TABLE settlements (
+    id VARCHAR(100) PRIMARY KEY,
+    invoice_id VARCHAR(50) NOT NULL UNIQUE REFERENCES invoices(id),
+    supplier_id VARCHAR(50) NOT NULL REFERENCES accounts(id),
+    buyer_id VARCHAR(50) NOT NULL REFERENCES accounts(id),
+    capital_provider_id VARCHAR(50) NOT NULL REFERENCES accounts(id),
+    amount DECIMAL(15,2) NOT NULL,
+    discount_rate DECIMAL(8,6) NOT NULL,
+    buyer_cost DECIMAL(15,2) NOT NULL,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'ROLLED_BACK')),
+    started_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP,
+    duration_seconds DECIMAL(8,3),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_settlements_invoice ON settlements(invoice_id);
+CREATE INDEX idx_settlements_supplier ON settlements(supplier_id);
+CREATE INDEX idx_settlements_status ON settlements(status);
+CREATE INDEX idx_settlements_completed ON settlements(completed_at);
+
+-- ============================================
+-- DECISION LEDGER (Immutable)
+-- ============================================
+
+CREATE TABLE decision_ledger (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    invariant_id VARCHAR(100) NOT NULL,
+    check_type VARCHAR(10) NOT NULL CHECK (check_type IN ('PRE', 'POST')),
+    result BOOLEAN NOT NULL,
+    action VARCHAR(20) NOT NULL CHECK (action IN ('PROCEED', 'ROLLBACK', 'FREEZE')),
+    state_snapshot JSONB NOT NULL,
+    signature VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_decision_ledger_invariant ON decision_ledger(invariant_id);
+CREATE INDEX idx_decision_ledger_created ON decision_ledger(created_at);
+CREATE INDEX idx_decision_ledger_result ON decision_ledger(result);
+
+-- Make ledger append-only
+CREATE RULE decision_ledger_no_update AS ON UPDATE TO decision_ledger DO INSTEAD NOTHING;
+CREATE RULE decision_ledger_no_delete AS ON DELETE TO decision_ledger DO INSTEAD NOTHING;
+
+-- ============================================
+-- PRICING QUOTES
+-- ============================================
+
+CREATE TABLE pricing_quotes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    invoice_id VARCHAR(50) NOT NULL REFERENCES invoices(id),
+    terms INTEGER NOT NULL,
+    discount_rate DECIMAL(8,6) NOT NULL,
+    total_cost DECIMAL(15,2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_pricing_quotes_invoice ON pricing_quotes(invoice_id);
+CREATE INDEX idx_pricing_quotes_expires ON pricing_quotes(expires_at);
+
+-- ============================================
+# FILE: db/seed.sql  
+# ============================================
+---
+-- InstantTrade Network - Seed Data
+-- Development and testing data
+
+-- Create test accounts
+INSERT INTO accounts (id, account_type, name, status, kyc_status) VALUES
+('SUP-001', 'SUPPLIER', 'Acme Manufacturing', 'ACTIVE', 'VERIFIED'),
+('SUP-002', 'SUPPLIER', 'Global Supplies Inc', 'ACTIVE', 'VERIFIED'),
+('SUP-003', 'SUPPLIER', 'Premium Parts Co', 'ACTIVE', 'VERIFIED'),
+('BUY-001', 'BUYER', 'TechCorp', 'ACTIVE', 'VERIFIED'),
+('BUY-002', 'BUYER', 'BuildCo', 'ACTIVE', 'VERIFIED'),
+('BUY-003', 'BUYER', 'Risky Buyer LLC', 'SUSPENDED', 'VERIFIED'),
+('CAP-001', 'CAPITAL_PROVIDER', 'InstantTrade Capital Fund', 'ACTIVE', 'VERIFIED'),
+('CAP-002', 'CAPITAL_PROVIDER', 'Working Capital Partners', 'ACTIVE', 'VERIFIED');
+
+-- ============================================
+# FILE: k8s/namespace.yaml
+# ============================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: instanttrade
+  labels:
+    name: instanttrade
+    environment: production
+
+---
+# FILE: k8s/configmap.yaml
+# ============================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: itn-config
+  namespace: instanttrade
+data:
+  # Application config
+  APP_NAME: "InstantTrade Network"
+  APP_VERSION: "1.0.0"
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  
+  # API config
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  API_WORKERS: "4"
+  
+  # Database config
+  DB_HOST: "postgres-service"
+  DB_PORT: "5432"
+  DB_NAME: "instanttrade"
+  
+  # Redis config
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  
+  # Metrics config
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "9090"
+
+---
+# FILE: k8s/secrets.yaml (template - replace with actual secrets)
+# ============================================
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: itn-secrets
+  namespace: instanttrade
+type: Opaque
+stringData:
+  # Database credentials
+  DB_USER: "itn_user"
+  DB_PASSWORD: "REPLACE_WITH_SECURE_PASSWORD"
+  
+  # System secret for cryptographic signing
+  SYSTEM_SECRET: "REPLACE_WITH_SECURE_RANDOM_KEY"
+  
+  # API keys
+  FRAUD_SERVICE_API_KEY: "REPLACE_WITH_API_KEY"
+  SANCTIONS_API_KEY: "REPLACE_WITH_API_KEY"
+
+---
+# FILE: k8s/database-statefulset.yaml
+# ============================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: instanttrade
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: instanttrade
+spec:
+  serviceName: postgres-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: itn-config
+              key: DB_NAME
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: itn-secrets
+              key: DB_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: itn-secrets
+              key: DB_PASSWORD
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# FILE: k8s/api-deployment.yaml
+# ============================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: itn-api
+  namespace: instanttrade
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: itn-api
+  template:
+    metadata:
+      labels:
+        app: itn-api
+    spec:
+      containers:
+      - name: api
+        image: instanttrade/api:1.0.0
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: APP_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: itn-config
+              key: APP_NAME
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: itn-config
+              key: DB_HOST
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: itn-secrets
+              key: DB_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: itn-secrets
+              key: DB_PASSWORD
+        - name: SYSTEM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: itn-secrets
+              key: SYSTEM_SECRET
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+---
+# FILE: k8s/api-service.yaml
+# ============================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: itn-api-service
+  namespace: instanttrade
+  labels:
+    app: itn-api
+spec:
+  selector:
+    app: itn-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+# FILE: k8s/ingress.yaml
+# ============================================
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: itn-ingress
+  namespace: instanttrade
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+spec:
+  tls:
+  - hosts:
+    - api.instanttrade.network
+    secretName: itn-tls
+  rules:
+  - host: api.instanttrade.network
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: itn-api-service
+            port:
+              number: 80
+
+---
+# FILE: k8s/hpa.yaml
+# ============================================
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: itn-api-hpa
+  namespace: instanttrade
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: itn-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 60
